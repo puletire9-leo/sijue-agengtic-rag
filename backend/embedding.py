@@ -29,7 +29,7 @@ class EmbeddingService:
     """文本向量化服务 - 密集向量本地模型 + BM25 稀疏向量（持久化统计）"""
 
     def __init__(self, state_path: Path | str | None = None):
-        self._embedder = _create_dense_embedder()
+        self._dense_model = None  # Lazy-loaded on first use
         self._state_path = Path(state_path or os.getenv("BM25_STATE_PATH", _DEFAULT_STATE_PATH))
         self._lock = threading.Lock()
 
@@ -70,6 +70,15 @@ class EmbeddingService:
         else:
             self._vocab_counter = 0
         self._recompute_avg_len()
+
+    @property
+    def dense_model(self) -> HuggingFaceEmbeddings:
+        """Lazy-load the dense embedding model on first use (thread-safe)."""
+        if self._dense_model is None:
+            with self._lock:
+                if self._dense_model is None:
+                    self._dense_model = _create_dense_embedder()
+        return self._dense_model
 
     def _persist_unlocked(self) -> None:
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -134,26 +143,39 @@ class EmbeddingService:
         if not texts:
             return []
         try:
-            return self._embedder.embed_documents(texts)
+            return self.dense_model.embed_documents(texts)
         except Exception as e:
             raise Exception(f"本地嵌入模型调用失败: {str(e)}") from e
+
+    _CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
+    _ENGLISH_RE = re.compile(r"[a-zA-Z]+")
 
     def tokenize(self, text: str) -> list[str]:
         text = text.lower()
         tokens = []
-        chinese_pattern = re.compile(r"[\u4e00-\u9fff]")
-        english_pattern = re.compile(r"[a-zA-Z]+")
+        chinese_pattern = self._CHINESE_RE
+        english_pattern = self._ENGLISH_RE
         i = 0
         while i < len(text):
             char = text[i]
             if chinese_pattern.match(char):
-                tokens.append(char)
-                i += 1
+                if i + 1 < len(text) and chinese_pattern.match(text[i + 1]):
+                    tokens.append(text[i:i+2])
+                    i += 2
+                else:
+                    tokens.append(char)
+                    i += 1
             elif english_pattern.match(char):
                 match = english_pattern.match(text[i:])
                 if match:
                     tokens.append(match.group())
                     i += len(match.group())
+            elif char.isdigit():
+                j = i + 1
+                while j < len(text) and text[j].isdigit():
+                    j += 1
+                tokens.append(text[i:j])
+                i = j
             else:
                 i += 1
         return tokens

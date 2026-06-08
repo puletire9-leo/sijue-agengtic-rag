@@ -1,8 +1,12 @@
 import json
+import logging
 import os
+import threading
 from typing import Any, Optional
 
 import redis
+
+logger = logging.getLogger(__name__)
 
 
 class RedisCache:
@@ -11,10 +15,13 @@ class RedisCache:
         self.key_prefix = os.getenv("REDIS_KEY_PREFIX", "supermew")
         self.default_ttl = int(os.getenv("REDIS_CACHE_TTL_SECONDS", "300"))
         self._client = None
+        self._lock = threading.Lock()
 
     def _get_client(self):
         if self._client is None:
-            self._client = redis.Redis.from_url(self.redis_url, decode_responses=True)
+            with self._lock:
+                if self._client is None:
+                    self._client = redis.Redis.from_url(self.redis_url, decode_responses=True)
         return self._client
 
     def _key(self, key: str) -> str:
@@ -26,30 +33,39 @@ class RedisCache:
             if not value:
                 return None
             return json.loads(value)
-        except Exception:
+        except Exception as e:
+            logger.debug("cache get_json failed for key=%s: %s", key, e)
             return None
 
     def set_json(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
         try:
             payload = json.dumps(value, ensure_ascii=False)
-            self._get_client().setex(self._key(key), ttl or self.default_ttl, payload)
-        except Exception:
-            return
+            self._get_client().setex(self._key(key), ttl if ttl is not None else self.default_ttl, payload)
+        except Exception as e:
+            logger.debug("cache set_json failed for key=%s: %s", key, e)
 
     def delete(self, key: str) -> None:
         try:
             self._get_client().delete(self._key(key))
-        except Exception:
-            return
+        except Exception as e:
+            logger.debug("cache delete failed for key=%s: %s", key, e)
 
     def delete_pattern(self, pattern: str) -> None:
+        """Delete keys matching *pattern* using SCAN (O(1) per call, non-blocking)."""
         try:
+            client = self._get_client()
             full_pattern = self._key(pattern)
-            keys = self._get_client().keys(full_pattern)
-            if keys:
-                self._get_client().delete(*keys)
-        except Exception:
-            return
+            cursor = 0
+            iterations = 0
+            while iterations < 1000:
+                cursor, keys = client.scan(cursor=cursor, match=full_pattern, count=500)
+                if keys:
+                    client.delete(*keys)
+                iterations += 1
+                if cursor == 0:
+                    break
+        except Exception as e:
+            logger.debug("cache delete_pattern failed for pattern=%s: %s", pattern, e)
 
 
 cache = RedisCache()

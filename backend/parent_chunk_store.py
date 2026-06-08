@@ -1,5 +1,5 @@
 """父级分块文档存储（用于 Auto-merging Retriever）"""
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List
 
 from cache import cache
@@ -36,6 +36,7 @@ class ParentChunkStore:
 
         db = SessionLocal()
         upserted = 0
+        pending_cache: list[tuple[str, dict]] = []
         try:
             for doc in docs:
                 chunk_id = (doc.get("chunk_id") or "").strip()
@@ -53,7 +54,7 @@ class ParentChunkStore:
                     "root_chunk_id": doc.get("root_chunk_id", ""),
                     "chunk_level": int(doc.get("chunk_level", 0) or 0),
                     "chunk_idx": int(doc.get("chunk_idx", 0) or 0),
-                    "updated_at": datetime.utcnow(),
+                    "updated_at": datetime.now(timezone.utc),
                 }
                 cache_payload = {
                     "chunk_id": chunk_id,
@@ -73,10 +74,13 @@ class ParentChunkStore:
                 else:
                     db.add(ParentChunk(chunk_id=chunk_id, **payload))
 
-                cache.set_json(self._cache_key(chunk_id), cache_payload)
+                pending_cache.append((self._cache_key(chunk_id), cache_payload))
                 upserted += 1
 
             db.commit()
+            # Write cache only after successful commit to avoid stale entries on rollback
+            for key, payload in pending_cache:
+                cache.set_json(key, payload)
         finally:
             db.close()
 

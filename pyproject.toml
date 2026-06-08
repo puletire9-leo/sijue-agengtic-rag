@@ -32,6 +32,18 @@ dependencies = [
     "redis>=5.2.1",
     "passlib[bcrypt]>=1.7.4",
     "python-jose[cryptography]>=3.3.0",
+    "alembic>=1.14.0",
+    "prometheus-client>=0.20.0",
+    "opentelemetry-api>=1.25.0",
+    "opentelemetry-sdk>=1.25.0",
+    "opentelemetry-exporter-otlp>=1.25.0",
+    "python-json-logger>=2.0.0",
+    "tenacity>=8.2.0",
+    # 新增：评测、MCP、向量计算
+    "ragas>=0.1.0",
+    "datasets>=2.14.0",
+    "aiohttp>=3.9.0",
+    "numpy>=1.24.0",
 ]
 
 [project.optional-dependencies]

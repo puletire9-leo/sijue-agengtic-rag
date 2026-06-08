@@ -1,0 +1,13 @@
+FROM ghcr.io/open-webui/open-webui:main
+
+# Copy NEW files only (no conflicts with official image)
+COPY open-webui-main/backend/open_webui/routers/starlink.py /app/backend/open_webui/routers/starlink.py
+COPY open-webui-main/backend/open_webui/routers/files.py /app/backend/open_webui/routers/files.py
+
+# Build-time: patch main.py to register starlink router
+COPY patch_main.py /tmp/patch_main.py
+RUN python3 /tmp/patch_main.py && rm /tmp/patch_main.py
+
+# Startup-time: incremental patches to middleware.py and openai.py
+COPY patch_openwebui.py /tmp/patch_openwebui.py
+CMD bash -c "python3 /tmp/patch_openwebui.py && exec bash start.sh"

@@ -2,7 +2,7 @@
 import os
 from typing import Dict, List
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, UnstructuredExcelLoader
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, UnstructuredExcelLoader, TextLoader, CSVLoader, UnstructuredHTMLLoader, UnstructuredPowerPointLoader
 
 
 class DocumentLoader:
@@ -135,6 +135,19 @@ class DocumentLoader:
         elif file_lower.endswith((".xlsx", ".xls")):
             doc_type = "Excel"
             loader = UnstructuredExcelLoader(file_path)
+        elif file_lower.endswith((".md", ".txt", ".json")):
+            ext = file_lower.rsplit(".", 1)[-1]
+            doc_type = {"md": "Markdown", "txt": "TXT", "json": "JSON"}.get(ext, "Text")
+            loader = TextLoader(file_path, encoding="utf-8")
+        elif file_lower.endswith(".csv"):
+            doc_type = "CSV"
+            loader = CSVLoader(file_path, encoding="utf-8")
+        elif file_lower.endswith((".html", ".htm")):
+            doc_type = "HTML"
+            loader = UnstructuredHTMLLoader(file_path)
+        elif file_lower.endswith(".pptx"):
+            doc_type = "PPT"
+            loader = UnstructuredPowerPointLoader(file_path)
         else:
             raise ValueError(f"不支持的文件类型: {filename}")
 
@@ -170,7 +183,7 @@ class DocumentLoader:
 
         for filename in os.listdir(folder_path):
             file_lower = filename.lower()
-            if not (file_lower.endswith(".pdf") or file_lower.endswith((".docx", ".doc")) or file_lower.endswith((".xlsx", ".xls"))):
+            if not (file_lower.endswith(".pdf") or file_lower.endswith((".docx", ".doc")) or file_lower.endswith((".xlsx", ".xls")) or file_lower.endswith((".md", ".txt", ".json", ".csv", ".html", ".htm", ".pptx"))):
                 continue
 
             file_path = os.path.join(folder_path, filename)

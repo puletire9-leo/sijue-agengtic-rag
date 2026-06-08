@@ -56,12 +56,16 @@ class MilvusManager:
 
         self._close_client(client)
 
-    def _run_with_reconnect(self, operation: Callable[[MilvusClient], T]) -> T:
+    def _run_with_reconnect(self, operation: Callable[[MilvusClient], T], _is_write: bool = False) -> T:
         client = self._get_client()
         try:
             return operation(client)
         except Exception as exc:
             if not self._is_closed_channel_error(exc):
+                raise
+
+            if _is_write:
+                self._reset_client(client)
                 raise
 
             self._reset_client(client)
@@ -77,16 +81,16 @@ class MilvusManager:
         def _init(client: MilvusClient) -> None:
             if not client.has_collection(self.collection_name):
                 schema = client.create_schema(auto_id=True, enable_dynamic_field=True)
-                
+
                 # 主键
                 schema.add_field("id", DataType.INT64, is_primary=True, auto_id=True)
-                
+
                 # 密集向量（来自 embedding 模型）
                 schema.add_field("dense_embedding", DataType.FLOAT_VECTOR, dim=dense_dim)
-                
+
                 # 稀疏向量（来自 BM25）
                 schema.add_field("sparse_embedding", DataType.SPARSE_FLOAT_VECTOR)
-                
+
                 # 文本和元数据字段
                 schema.add_field("text", DataType.VARCHAR, max_length=2000)
                 schema.add_field("filename", DataType.VARCHAR, max_length=255)
@@ -94,6 +98,7 @@ class MilvusManager:
                 schema.add_field("file_path", DataType.VARCHAR, max_length=1024)
                 schema.add_field("page_number", DataType.INT64)
                 schema.add_field("chunk_idx", DataType.INT64)
+                schema.add_field("kb_id", DataType.VARCHAR, max_length=36)
 
                 # Auto-merging 所需层级字段
                 schema.add_field("chunk_id", DataType.VARCHAR, max_length=512)
@@ -125,12 +130,26 @@ class MilvusManager:
                     schema=schema,
                     index_params=index_params
                 )
+            else:
+                # 迁移：为已有集合添加 kb_id 字段（如果不存在）
+                try:
+                    fields = client.describe_collection(self.collection_name).get("fields", [])
+                    field_names = [f["name"] for f in fields]
+                    if "kb_id" not in field_names:
+                        client.alter_collection(
+                            collection_name=self.collection_name,
+                            field_name="kb_id",
+                            field_type=DataType.VARCHAR,
+                            max_length=36
+                        )
+                except Exception:
+                    pass  # 忽略迁移错误，已有数据 kb_id 为空字符串
 
         self._run_with_reconnect(_init)
 
     def insert(self, data: list[dict]):
         """插入数据到 Milvus"""
-        return self._run_with_reconnect(lambda client: client.insert(self.collection_name, data))
+        return self._run_with_reconnect(lambda client: client.insert(self.collection_name, data), _is_write=True)
 
     def query(
         self,
@@ -178,7 +197,7 @@ class MilvusManager:
         ids = [item for item in chunk_ids if item]
         if not ids:
             return []
-        quoted_ids = ", ".join([f'"{item}"' for item in ids])
+        quoted_ids = ", ".join([f'"{item.replace(chr(92), chr(92) + chr(92)).replace(chr(34), chr(92) + chr(34))}"' for item in ids])
         filter_expr = f"chunk_id in [{quoted_ids}]"
         return self.query(
             filter_expr=filter_expr,
@@ -305,20 +324,68 @@ class MilvusManager:
         formatted_results = []
         for hits in results:
             for hit in hits:
+                entity = hit.get("entity") or {}
                 formatted_results.append({
                     "id": hit.get("id"),
-                    "text": hit.get("entity", {}).get("text", ""),
-                    "filename": hit.get("entity", {}).get("filename", ""),
-                    "file_type": hit.get("entity", {}).get("file_type", ""),
-                    "page_number": hit.get("entity", {}).get("page_number", 0),
-                    "chunk_id": hit.get("entity", {}).get("chunk_id", ""),
-                    "parent_chunk_id": hit.get("entity", {}).get("parent_chunk_id", ""),
-                    "root_chunk_id": hit.get("entity", {}).get("root_chunk_id", ""),
-                    "chunk_level": hit.get("entity", {}).get("chunk_level", 0),
-                    "chunk_idx": hit.get("entity", {}).get("chunk_idx", 0),
+                    "text": entity.get("text", ""),
+                    "filename": entity.get("filename", ""),
+                    "file_type": entity.get("file_type", ""),
+                    "page_number": entity.get("page_number", 0),
+                    "chunk_id": entity.get("chunk_id", ""),
+                    "parent_chunk_id": entity.get("parent_chunk_id", ""),
+                    "root_chunk_id": entity.get("root_chunk_id", ""),
+                    "chunk_level": entity.get("chunk_level", 0),
+                    "chunk_idx": entity.get("chunk_idx", 0),
                     "score": hit.get("distance", 0.0)
                 })
         
+        return formatted_results
+
+    def sparse_retrieve(self, sparse_embedding: dict, top_k: int = 5, filter_expr: str = "") -> list[dict]:
+        """
+        仅使用稀疏向量检索（BM25 纯关键词模式）。
+
+        :param sparse_embedding: 稀疏向量 {index: value, ...}
+        :param top_k: 返回结果数量
+        :param filter_expr: 过滤表达式
+        :return: 检索结果列表
+        """
+        output_fields = [
+            "text", "filename", "file_type", "page_number",
+            "chunk_id", "parent_chunk_id", "root_chunk_id",
+            "chunk_level", "chunk_idx",
+        ]
+
+        results = self._run_with_reconnect(
+            lambda client: client.search(
+                collection_name=self.collection_name,
+                data=[sparse_embedding],
+                anns_field="sparse_embedding",
+                search_params={"metric_type": "IP", "params": {"drop_ratio_search": 0.2}},
+                limit=top_k,
+                output_fields=output_fields,
+                filter=filter_expr,
+            )
+        )
+
+        formatted_results = []
+        for hits in results:
+            for hit in hits:
+                entity = hit.get("entity") or {}
+                formatted_results.append({
+                    "id": hit.get("id"),
+                    "text": entity.get("text", ""),
+                    "filename": entity.get("filename", ""),
+                    "file_type": entity.get("file_type", ""),
+                    "page_number": entity.get("page_number", 0),
+                    "chunk_id": entity.get("chunk_id", ""),
+                    "parent_chunk_id": entity.get("parent_chunk_id", ""),
+                    "root_chunk_id": entity.get("root_chunk_id", ""),
+                    "chunk_level": entity.get("chunk_level", 0),
+                    "chunk_idx": entity.get("chunk_idx", 0),
+                    "score": hit.get("distance", 0.0),
+                })
+
         return formatted_results
 
     def delete(self, filter_expr: str):
@@ -327,7 +394,8 @@ class MilvusManager:
             lambda client: client.delete(
                 collection_name=self.collection_name,
                 filter=filter_expr
-            )
+            ),
+            _is_write=True,
         )
 
     def has_collection(self) -> bool:

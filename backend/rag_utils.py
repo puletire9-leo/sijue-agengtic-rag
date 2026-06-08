@@ -1,10 +1,16 @@
+import logging
 from collections import defaultdict
 from typing import List, Tuple, Dict, Any
 import os
 import json
+import time
+import threading
 import requests
 from dotenv import load_dotenv
 
+logger = logging.getLogger(__name__)
+
+from metrics import RAG_RETRIEVAL_COUNT, RAG_RETRIEVAL_LATENCY
 from milvus_client import MilvusManager
 from embedding import embedding_service as _embedding_service
 from parent_chunk_store import ParentChunkStore
@@ -19,8 +25,39 @@ RERANK_MODEL = os.getenv("RERANK_MODEL")
 RERANK_BINDING_HOST = os.getenv("RERANK_BINDING_HOST")
 RERANK_API_KEY = os.getenv("RERANK_API_KEY")
 AUTO_MERGE_ENABLED = os.getenv("AUTO_MERGE_ENABLED", "true").lower() != "false"
-AUTO_MERGE_THRESHOLD = int(os.getenv("AUTO_MERGE_THRESHOLD", "2"))
+AUTO_MERGE_THRESHOLD = int(os.getenv("AUTO_MERGE_THRESHOLD", "3"))
 LEAF_RETRIEVE_LEVEL = int(os.getenv("LEAF_RETRIEVE_LEVEL", "3"))
+
+# ── Rerank circuit breaker ──
+_RERANK_FAILURE_COUNT = 0
+_RERANK_CIRCUIT_OPEN_UNTIL = 0
+_RERANK_LOCK = threading.Lock()
+RERANK_TIMEOUT = int(os.getenv("RERANK_TIMEOUT", "5"))
+RERANK_CIRCUIT_THRESHOLD = 3
+RERANK_CIRCUIT_COOLDOWN = 60
+
+
+def _is_rerank_circuit_open():
+    global _RERANK_CIRCUIT_OPEN_UNTIL
+    with _RERANK_LOCK:
+        if time.time() < _RERANK_CIRCUIT_OPEN_UNTIL:
+            return True
+    return False
+
+
+def _record_rerank_failure():
+    global _RERANK_FAILURE_COUNT, _RERANK_CIRCUIT_OPEN_UNTIL
+    with _RERANK_LOCK:
+        _RERANK_FAILURE_COUNT += 1
+        if _RERANK_FAILURE_COUNT >= RERANK_CIRCUIT_THRESHOLD:
+            _RERANK_CIRCUIT_OPEN_UNTIL = time.time() + RERANK_CIRCUIT_COOLDOWN
+            _RERANK_FAILURE_COUNT = 0
+
+
+def _record_rerank_success():
+    global _RERANK_FAILURE_COUNT
+    with _RERANK_LOCK:
+        _RERANK_FAILURE_COUNT = 0
 
 # 全局初始化检索依赖（与 api 共用 embedding_service，保证 BM25 状态一致）
 _milvus_manager = MilvusManager()
@@ -50,6 +87,18 @@ def _merge_to_parent_level(docs: List[dict], threshold: int = 2) -> Tuple[List[d
     parent_docs = _parent_chunk_store.get_documents_by_ids(merge_parent_ids)
     parent_map = {item.get("chunk_id", ""): item for item in parent_docs if item.get("chunk_id")}
 
+    # Pre-compute max child score per parent_id so the best score is preserved
+    max_child_score: Dict[str, float] = {}
+    for parent_id, children in groups.items():
+        if parent_id not in parent_map:
+            continue
+        for child in children:
+            s = child.get("score")
+            if s is not None:
+                s = float(s)
+                if parent_id not in max_child_score or s > max_child_score[parent_id]:
+                    max_child_score[parent_id] = s
+
     merged_docs: List[dict] = []
     merged_count = 0
     for doc in docs:
@@ -58,9 +107,11 @@ def _merge_to_parent_level(docs: List[dict], threshold: int = 2) -> Tuple[List[d
             merged_docs.append(doc)
             continue
         parent_doc = dict(parent_map[parent_id])
-        score = doc.get("score")
-        if score is not None:
-            parent_doc["score"] = max(float(parent_doc.get("score", score)), float(score))
+        if parent_id in max_child_score:
+            parent_doc["score"] = max(
+                float(parent_doc.get("score", max_child_score[parent_id])),
+                max_child_score[parent_id],
+            )
         parent_doc["merged_from_children"] = True
         parent_doc["merged_child_count"] = len(groups[parent_id])
         merged_docs.append(parent_doc)
@@ -118,6 +169,12 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
     if not docs_with_rank or not meta["rerank_enabled"]:
         return docs_with_rank[:top_k], meta
 
+    # ── Circuit breaker: skip rerank if too many recent failures ──
+    if _is_rerank_circuit_open():
+        meta["rerank_error"] = "circuit_breaker_open"
+        logger.warning("Rerank circuit breaker is open, skipping rerank")
+        return docs_with_rank[:top_k], meta
+
     payload = {
         "model": RERANK_MODEL,
         "query": query,
@@ -136,10 +193,11 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
             meta["rerank_endpoint"],
             headers=headers,
             json=payload,
-            timeout=15,
+            timeout=RERANK_TIMEOUT,
         )
         if response.status_code >= 400:
             meta["rerank_error"] = f"HTTP {response.status_code}: {response.text}"
+            _record_rerank_failure()
             return docs_with_rank[:top_k], meta
 
         items = response.json().get("results", [])
@@ -154,12 +212,15 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
                 reranked.append(doc)
 
         if reranked:
+            _record_rerank_success()
             return reranked[:top_k], meta
 
         meta["rerank_error"] = "empty_rerank_results"
+        _record_rerank_failure()
         return docs_with_rank[:top_k], meta
     except (requests.RequestException, json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
         meta["rerank_error"] = str(e)
+        _record_rerank_failure()
         return docs_with_rank[:top_k], meta
 
 
@@ -183,8 +244,12 @@ def _generate_step_back_question(query: str) -> str:
     if not model:
         return ""
     prompt = (
-        "请将用户的具体问题抽象成更高层次、更概括的‘退步问题’，"
-        "用于探寻背后的通用原理或核心概念。只输出退步问题一句话，不要解释。\n"
+        "请将用户的具体问题改写为一个更高层次、不同角度的搜索查询，"
+        "用于在知识库中检索相关的通用原理或背景知识。\n"
+        "要求：\n"
+        "- 不要包含原查询中的专有名词和具体术语\n"
+        "- 使用不同的措辞和表达方式\n"
+        "- 输出一句简短的搜索查询，不要解释\n\n"
         f"用户问题：{query}"
     )
     try:
@@ -227,12 +292,13 @@ def generate_hypothetical_document(query: str) -> str:
 def step_back_expand(query: str) -> dict:
     step_back_question = _generate_step_back_question(query)
     step_back_answer = _answer_step_back_question(step_back_question)
-    if step_back_question or step_back_answer:
+    if step_back_question:
         expanded_query = (
-            f"{query}\n\n"
-            f"退步问题：{step_back_question}\n"
-            f"退步问题答案：{step_back_answer}"
+            f"{step_back_question}\n"
+            f"（原始问题背景：{query}）"
         )
+        if step_back_answer:
+            expanded_query += f"\n参考背景：{step_back_answer}"
     else:
         expanded_query = query
     return {
@@ -242,60 +308,162 @@ def step_back_expand(query: str) -> dict:
     }
 
 
-def retrieve_documents(query: str, top_k: int = 5) -> Dict[str, Any]:
+def retrieve_documents(
+    query: str,
+    top_k: int = 5,
+    strategy: str = "hybrid",
+    skip_rerank: bool = False,
+    extra_filter: str = "",
+    kb_ids: list[str] | None = None,
+) -> Dict[str, Any]:
+    """混合/单路检索，v3: 支持策略选择和跳过 rerank。
+
+    Args:
+        query: 查询文本
+        top_k: 返回数量
+        strategy: 检索策略 (hybrid / dense_only / sparse_only / entity_boosted)
+        skip_rerank: True 时跳过 rerank（由 graph 的 progressive_rerank 节点处理）
+        extra_filter: 额外 Milvus 过滤表达式（如按章节 root_chunk_id 过滤），
+                      与 chunk_level 条件 AND 拼接
+        kb_ids: 可访问的知识库 ID 列表，为空则搜索所有
+
+    Returns:
+        {"docs": [...], "meta": {...}}
+    """
     candidate_k = max(top_k * 3, top_k)
     filter_expr = f"chunk_level == {LEAF_RETRIEVE_LEVEL}"
-    try:
-        dense_embeddings = _embedding_service.get_embeddings([query])
-        dense_embedding = dense_embeddings[0]
-        sparse_embedding = _embedding_service.get_sparse_embedding(query)
+    if kb_ids:
+        quoted = ", ".join(f'"{kid}"' for kid in kb_ids)
+        filter_expr += f" && kb_id in [{quoted}]"
+    if extra_filter:
+        filter_expr += f" && {extra_filter}"
+    rerank_meta: Dict[str, Any] = {
+        "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
+        "rerank_applied": False,
+        "rerank_model": RERANK_MODEL,
+        "rerank_endpoint": _get_rerank_endpoint(),
+        "rerank_error": None,
+        "candidate_k": candidate_k,
+        "leaf_retrieve_level": LEAF_RETRIEVE_LEVEL,
+    }
 
-        retrieved = _milvus_manager.hybrid_retrieve(
-            dense_embedding=dense_embedding,
-            sparse_embedding=sparse_embedding,
-            top_k=candidate_k,
-            filter_expr=filter_expr,
-        )
-        reranked, rerank_meta = _rerank_documents(query=query, docs=retrieved, top_k=top_k)
-        merged_docs, merge_meta = _auto_merge_documents(docs=reranked, top_k=top_k)
-        rerank_meta["retrieval_mode"] = "hybrid"
-        rerank_meta["candidate_k"] = candidate_k
-        rerank_meta["leaf_retrieve_level"] = LEAF_RETRIEVE_LEVEL
-        rerank_meta.update(merge_meta)
-        return {"docs": merged_docs, "meta": rerank_meta}
-    except Exception:
-        try:
-            dense_embeddings = _embedding_service.get_embeddings([query])
-            dense_embedding = dense_embeddings[0]
+    # ── 按策略生成所需 embedding ──
+    needs_dense = strategy in ("hybrid", "dense_only", "entity_boosted")
+    needs_sparse = strategy in ("hybrid", "sparse_only", "entity_boosted")
+
+    dense_embedding = None
+    sparse_embedding = None
+
+    try:
+        if needs_dense:
+            dense_embedding = _embedding_service.get_embeddings([query])[0]
+        if needs_sparse:
+            sparse_embedding = _embedding_service.get_sparse_embedding(query)
+
+        # ── 按策略路由到不同检索方法 ──
+        if strategy == "sparse_only":
+            rerank_meta["retrieval_mode"] = "sparse_only"
+            if sparse_embedding is None:
+                raise ValueError("sparse_only strategy requires sparse embedding")
+            retrieved = _milvus_manager.sparse_retrieve(
+                sparse_embedding=sparse_embedding,
+                top_k=candidate_k,
+                filter_expr=filter_expr,
+            )
+        elif strategy == "dense_only":
+            rerank_meta["retrieval_mode"] = "dense_only"
+            if dense_embedding is None:
+                raise ValueError("dense_only strategy requires dense embedding")
             retrieved = _milvus_manager.dense_retrieve(
                 dense_embedding=dense_embedding,
                 top_k=candidate_k,
                 filter_expr=filter_expr,
             )
-            reranked, rerank_meta = _rerank_documents(query=query, docs=retrieved, top_k=top_k)
-            merged_docs, merge_meta = _auto_merge_documents(docs=reranked, top_k=top_k)
-            rerank_meta["retrieval_mode"] = "dense_fallback"
-            rerank_meta["candidate_k"] = candidate_k
-            rerank_meta["leaf_retrieve_level"] = LEAF_RETRIEVE_LEVEL
-            rerank_meta.update(merge_meta)
-            return {"docs": merged_docs, "meta": rerank_meta}
-        except Exception:
-            return {
-                "docs": [],
-                "meta": {
-                    "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
-                    "rerank_applied": False,
-                    "rerank_model": RERANK_MODEL,
-                    "rerank_endpoint": _get_rerank_endpoint(),
-                    "rerank_error": "retrieve_failed",
-                    "retrieval_mode": "failed",
-                    "candidate_k": candidate_k,
-                    "leaf_retrieve_level": LEAF_RETRIEVE_LEVEL,
-                    "auto_merge_enabled": AUTO_MERGE_ENABLED,
-                    "auto_merge_applied": False,
-                    "auto_merge_threshold": AUTO_MERGE_THRESHOLD,
-                    "auto_merge_replaced_chunks": 0,
-                    "auto_merge_steps": 0,
-                    "candidate_count": 0,
-                },
-            }
+        else:  # hybrid / entity_boosted
+            rerank_meta["retrieval_mode"] = strategy
+            retrieved = _milvus_manager.hybrid_retrieve(
+                dense_embedding=dense_embedding,
+                sparse_embedding=sparse_embedding,
+                top_k=candidate_k,
+                filter_expr=filter_expr,
+            )
+
+        # ── Rerank（可跳过，由 graph 的 progressive_rerank 处理）──
+        if skip_rerank:
+            # 保留原始检索分数，后续由 progressive_rerank 精排
+            docs_for_merge = [{**d, "rrf_rank": i} for i, d in enumerate(retrieved, 1)]
+        else:
+            docs_for_merge, rr_meta = _rerank_documents(query=query, docs=retrieved, top_k=top_k)
+            rerank_meta.update(rr_meta)
+
+        merged_docs, merge_meta = _auto_merge_documents(docs=docs_for_merge, top_k=top_k)
+        rerank_meta.update(merge_meta)
+        RAG_RETRIEVAL_COUNT.labels(strategy=strategy, result="success").inc()
+        return {"docs": merged_docs, "meta": rerank_meta}
+
+    except Exception as e:
+        logger.warning(f"Retrieval strategy {strategy} failed: {e}")
+        # 降级：hybrid → dense_only → sparse_only 依次回退
+        if strategy == "dense_only":
+            # dense_only already failed; skip straight to sparse_only
+            fallback_order = [("sparse_only", needs_sparse, True, sparse_embedding)]
+        elif strategy in ("hybrid", "entity_boosted"):
+            fallback_order = [
+                ("dense_only", needs_dense, False, dense_embedding),
+                ("sparse_only", needs_sparse, True, sparse_embedding),
+            ]
+        else:  # sparse_only
+            fallback_order = [("dense_only", False, True, None)]
+
+        for fb_strategy, already_generated, needs_gen, emb in fallback_order:
+            try:
+                if already_generated and emb is None:
+                    continue
+                if needs_gen and emb is None:
+                    if fb_strategy == "dense_only":
+                        emb = _embedding_service.get_embeddings([query])[0]
+                        retrieved = _milvus_manager.dense_retrieve(
+                            dense_embedding=emb, top_k=candidate_k, filter_expr=filter_expr,
+                        )
+                    else:
+                        continue
+                elif fb_strategy == "dense_only":
+                    retrieved = _milvus_manager.dense_retrieve(
+                        dense_embedding=emb, top_k=candidate_k, filter_expr=filter_expr,
+                    )
+                else:  # sparse_only fallback
+                    if emb is None:
+                        emb = _embedding_service.get_sparse_embedding(query)
+                    retrieved = _milvus_manager.sparse_retrieve(
+                        sparse_embedding=emb, top_k=candidate_k, filter_expr=filter_expr,
+                    )
+
+                if not skip_rerank:
+                    docs_for_merge, rr_meta = _rerank_documents(query=query, docs=retrieved, top_k=top_k)
+                    rerank_meta.update(rr_meta)
+                else:
+                    docs_for_merge = [{**d, "rrf_rank": i} for i, d in enumerate(retrieved, 1)]
+
+                merged_docs, merge_meta = _auto_merge_documents(docs=docs_for_merge, top_k=top_k)
+                rerank_meta["retrieval_mode"] = f"{fb_strategy}_fallback"
+                rerank_meta.update(merge_meta)
+                RAG_RETRIEVAL_COUNT.labels(strategy=fb_strategy, result="fallback").inc()
+                return {"docs": merged_docs, "meta": rerank_meta}
+            except Exception as e:
+                logger.warning(f"Retrieval strategy {fb_strategy} failed: {e}")
+                continue
+
+        RAG_RETRIEVAL_COUNT.labels(strategy=strategy, result="empty").inc()
+        return {
+            "docs": [],
+            "meta": {
+                **rerank_meta,
+                "retrieval_mode": "failed",
+                "rerank_error": "retrieve_failed",
+                "auto_merge_applied": False,
+                "auto_merge_threshold": AUTO_MERGE_THRESHOLD,
+                "auto_merge_replaced_chunks": 0,
+                "auto_merge_steps": 0,
+                "candidate_count": 0,
+            },
+        }

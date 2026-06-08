@@ -1,69 +1,78 @@
 from typing import Optional
+import contextvars
+import logging
 import os
+import threading
 import requests
 from dotenv import load_dotenv
-try:
-    from langchain_core.tools import tool
-except ImportError:
-    from langchain_core.tools import tool
+from langchain_core.tools import tool
 
+logger = logging.getLogger(__name__)
 load_dotenv()
 
 AMAP_WEATHER_API = os.getenv("AMAP_WEATHER_API")
 AMAP_API_KEY = os.getenv("AMAP_API_KEY")
 
-_LAST_RAG_CONTEXT = None
-_KNOWLEDGE_TOOL_CALLS_THIS_TURN = 0
-_RAG_STEP_QUEUE = None  # asyncio.Queue, set by agent before streaming
-_RAG_STEP_LOOP = None   # asyncio loop, captured when setting queue
+_RAG_CONTEXT_VAR: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar('_rag_context', default=None)
+_TOOL_CALLS_GUARD: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar('_tool_calls_guard', default=None)
+_CURRENT_USER_VAR: contextvars.ContextVar[str] = contextvars.ContextVar('_current_user', default='default')
+_CURRENT_KB_IDS_VAR: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar('_current_kb_ids', default=None)
+
+# 全局变量：跨线程传播 rag_context（ContextVar 在 LangChain 工具执行器中不可靠）
+_last_rag_context: Optional[dict] = None
+_rag_context_lock = threading.Lock()
 
 
 def _set_last_rag_context(context: dict):
-    global _LAST_RAG_CONTEXT
-    _LAST_RAG_CONTEXT = context
+    global _last_rag_context
+    _RAG_CONTEXT_VAR.set(context)
+    with _rag_context_lock:
+        _last_rag_context = context
 
 
 def get_last_rag_context(clear: bool = True) -> Optional[dict]:
     """获取最近一次 RAG 检索上下文，默认读取后清空。"""
-    global _LAST_RAG_CONTEXT
-    context = _LAST_RAG_CONTEXT
+    global _last_rag_context
+    # 优先从全局变量读（跨线程可靠）
+    with _rag_context_lock:
+        context = _last_rag_context
     if clear:
-        _LAST_RAG_CONTEXT = None
+        with _rag_context_lock:
+            _last_rag_context = None
+        _RAG_CONTEXT_VAR.set(None)
     return context
 
 
 def reset_tool_call_guards():
     """每轮对话开始时重置工具调用计数。"""
-    global _KNOWLEDGE_TOOL_CALLS_THIS_TURN
-    _KNOWLEDGE_TOOL_CALLS_THIS_TURN = 0
+    _TOOL_CALLS_GUARD.set({"count": 0})
 
 
-def set_rag_step_queue(queue):
-    """设置 RAG 步骤队列，并捕获当前事件循环以便跨线程调度。"""
-    global _RAG_STEP_QUEUE, _RAG_STEP_LOOP
-    _RAG_STEP_QUEUE = queue
-    if queue:
-        import asyncio
-        try:
-            _RAG_STEP_LOOP = asyncio.get_running_loop()
-        except RuntimeError:
-            _RAG_STEP_LOOP = asyncio.get_event_loop()
-    else:
-        _RAG_STEP_LOOP = None
+def set_current_user(user_id: str):
+    """设置当前用户 ID（Agent 每次调用前设置）。"""
+    _CURRENT_USER_VAR.set(user_id)
 
 
-def emit_rag_step(icon: str, label: str, detail: str = ""):
-    """向队列发送一个 RAG 检索步骤。支持跨线程安全调用。"""
-    global _RAG_STEP_QUEUE, _RAG_STEP_LOOP
-    if _RAG_STEP_QUEUE is not None and _RAG_STEP_LOOP is not None:
-        step = {"icon": icon, "label": label, "detail": detail}
-        try:
-            if not _RAG_STEP_LOOP.is_closed():
-                _RAG_STEP_LOOP.call_soon_threadsafe(_RAG_STEP_QUEUE.put_nowait, step)
-        except Exception:
-            pass
+def get_current_user() -> str:
+    """获取当前用户 ID。"""
+    return _CURRENT_USER_VAR.get()
 
 
+def set_current_kb_ids(kb_ids: list[str]):
+    """设置当前可访问的知识库 ID 列表。"""
+    _CURRENT_KB_IDS_VAR.set(kb_ids)
+
+
+def get_current_kb_ids() -> Optional[list[str]]:
+    """获取当前可访问的知识库 ID 列表。"""
+    return _CURRENT_KB_IDS_VAR.get()
+
+
+# Re-exported from events.py (shared module, no circular import)
+from events import set_rag_step_queue, emit_rag_step
+
+
+@tool("get_current_weather")
 def get_current_weather(location: str, extensions: Optional[str] = "base") -> str:
     """获取天气信息"""
     if not location:
@@ -128,40 +137,51 @@ def get_current_weather(location: str, extensions: Optional[str] = "base") -> st
 @tool("search_knowledge_base")
 def search_knowledge_base(query: str) -> str:
     """Search for information in the knowledge base using hybrid retrieval (dense + sparse vectors)."""
-    # ... guards omitted ...
-    global _KNOWLEDGE_TOOL_CALLS_THIS_TURN
-    if _KNOWLEDGE_TOOL_CALLS_THIS_TURN >= 1:
+    guard = _TOOL_CALLS_GUARD.get()
+    if guard is None:
+        guard = {"count": 0}
+        _TOOL_CALLS_GUARD.set(guard)
+    if guard["count"] >= 1:
         return (
-            "TOOL_CALL_LIMIT_REACHED: search_knowledge_base has already been called once in this turn. "
-            "Use the existing retrieval result and provide the final answer directly."
+            "TOOL_CALL_LIMIT_REACHED: search_knowledge_base 工具本轮已调用一次，"
+            "请使用现有检索结果直接生成最终回答。"
         )
-    _KNOWLEDGE_TOOL_CALLS_THIS_TURN += 1
+    guard["count"] += 1
 
-    from rag_pipeline import run_rag_graph
+    from agentic_rag.runner import run_agentic_rag_sync, format_rag_result
+    # search_knowledge_base 是 sync 函数，LangChain agent.astream()
+    # 会在线程池中执行它，不会阻塞 asyncio 事件循环。
+    # emit_rag_step → call_soon_threadsafe 从子线程安全投递事件。
+    kb_ids = get_current_kb_ids()
+    user_id = get_current_user()
+    rag_result = run_agentic_rag_sync(query, user_id=user_id, kb_ids=kb_ids)
+    result = format_rag_result(rag_result)
 
-    # 在同步工具中获取当前的 Loop 可能不可靠，但我们之前是通过 call_soon_threadsafe 调度的。
-    # 这里 _RAG_STEP_QUEUE 是在主线程/Loop 设置的全局变量。
-    # 如果工具运行在线程池中，它是可以访问到全局变量 _RAG_STEP_QUEUE 的。
-    # emit_rag_step 内部做了 try-except 和 get_event_loop()。
-
-    # 问题可能出在 asyncio.get_event_loop() 在子线程中调用会报错或者拿不到主线程的loop。
-    # 我们应该在 set_rag_step_queue 时也保存 loop 引用，或者在 emit_rag_step 中更健壮地获取 loop。
-
-    rag_result = run_rag_graph(query)
-
-    docs = rag_result.get("docs", []) if isinstance(rag_result, dict) else []
-    rag_trace = rag_result.get("rag_trace", {}) if isinstance(rag_result, dict) else {}
+    docs = result.get("docs", [])
+    rag_trace = result.get("rag_trace", {})
     if rag_trace:
         _set_last_rag_context({"rag_trace": rag_trace})
+        # 传播 RAG 上下文到主事件循环：线程池中 ContextVar 不会传播到父异步任务，
+        # 需要通过 call_soon_threadsafe 将上下文推入 SSE 队列。
+        try:
+            from events import get_rag_step_queue
+            _q = get_rag_step_queue()
+            _loop = getattr(_q, '_loop', None)
+            if _q is not None and _loop is not None and not _loop.is_closed():
+                _loop.call_soon_threadsafe(
+                    _q.put_nowait, {"type": "rag_context", "context": {"rag_trace": rag_trace}}
+                )
+        except Exception as e:
+            logger.warning("Failed to propagate rag_context to SSE queue: %s", e)
 
     if not docs:
         return "No relevant documents found in the knowledge base."
 
     formatted = []
-    for i, result in enumerate(docs, 1):
-        source = result.get("filename", "Unknown")
-        page = result.get("page_number", "N/A")
-        text = result.get("text", "")
+    for i, doc in enumerate(docs, 1):
+        source = doc.get("filename", "Unknown")
+        page = doc.get("page_number", "N/A")
+        text = doc.get("text", "")
         formatted.append(f"[{i}] {source} (Page {page}):\n{text}")
 
     return "Retrieved Chunks:\n" + "\n\n---\n\n".join(formatted)

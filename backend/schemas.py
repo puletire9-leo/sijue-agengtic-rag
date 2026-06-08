@@ -1,17 +1,17 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 
 
 class RegisterRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=6, max_length=128)
     role: Optional[str] = "user"
     admin_code: Optional[str] = None
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=128)
 
 
 class AuthResponse(BaseModel):
@@ -24,16 +24,17 @@ class AuthResponse(BaseModel):
 class CurrentUserResponse(BaseModel):
     username: str
     role: str
+    budget_max: int
 
 
 class ChatRequest(BaseModel):
-    message: str
-    session_id: Optional[str] = "default_session"
+    message: str = Field(max_length=10000)
+    session_id: Optional[str] = Field(default="default_session", max_length=120)
 
 
 class RetrievedChunk(BaseModel):
     filename: str
-    page_number: Optional[str | int] = None
+    page_number: Optional[int] = None
     text: Optional[str] = None
     score: Optional[float] = None
     rrf_rank: Optional[int] = None
@@ -75,7 +76,7 @@ class RagTrace(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
-    rag_trace: Optional[RagTrace] = None
+    rag_trace: Optional[dict] = None
 
 
 class MessageInfo(BaseModel):
@@ -87,12 +88,14 @@ class MessageInfo(BaseModel):
 
 class SessionMessagesResponse(BaseModel):
     messages: List[MessageInfo]
+    total: int = 0
 
 
 class SessionInfo(BaseModel):
     session_id: str
     updated_at: str
     message_count: int
+    title: Optional[str] = None
 
 
 class SessionListResponse(BaseModel):
@@ -108,6 +111,7 @@ class DocumentInfo(BaseModel):
     filename: str
     file_type: str
     chunk_count: int
+    size: Optional[int] = None
     uploaded_at: Optional[str] = None
 
 
@@ -155,8 +159,16 @@ class DocumentDeleteStartResponse(BaseModel):
     message: str
 
 
-class DocumentDeleteJobResponse(DocumentUploadJobResponse):
-    pass
+class DocumentDeleteJobResponse(BaseModel):
+    job_id: str
+    filename: str
+    status: str
+    current_step: str
+    message: str
+    error: Optional[str] = None
+    created_at: str
+    updated_at: str
+    steps: List[UploadStepInfo]
 
 
 class DocumentDeleteResponse(BaseModel):

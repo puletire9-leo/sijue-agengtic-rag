@@ -1,0 +1,46 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[oc]
+*.egg-info
+dist/
+build/
+.venv
+.env
+
+# Docker
+docker-compose*.yml
+Dockerfile*
+.dockerignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Volumes (data)
+volumes/
+
+# Data (keep eval golden dataset, exclude runtime data)
+data/*
+!data/eval/
+data/eval/*
+!data/eval/golden_dataset.json
+
+# Tests
+tests/
+
+# Documentation
+*.md
+docs/
+
+# Langchain study (not needed in production)
+langchain-study/

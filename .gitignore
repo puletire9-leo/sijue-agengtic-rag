@@ -8,9 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
-.env    
+.env
 
-#docker files
+# Docker volumes
 volumes/
 
 # OS files
@@ -19,3 +19,25 @@ data/
 
 # test
 tests/
+
+# Model files (symlink + actual)
+models
+models/
+
+# Open WebUI (separate project, ~2.3GB)
+open-webui-main/
+
+# Node.js
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build artifacts
+*.so
+*.dylib
+*.dll
+*.wasm
